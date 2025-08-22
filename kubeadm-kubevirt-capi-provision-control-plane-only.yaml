@@ -1,0 +1,173 @@
+# CAPI Spec để adopt VM có sẵn CHỈ CHO CONTROL PLANE để test
+# Focus vào adoption flow đơn giản
+
+---
+# Cluster resource - định nghĩa toàn bộ cluster
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: kubeadm-vm-adoption-test
+  namespace: vm-lab
+  labels:
+    cluster-type: existing-vm-adoption
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+        - 10.243.0.0/16
+    services:
+      cidrBlocks:
+        - 10.95.0.0/16
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+    kind: KubevirtCluster
+    name: kubeadm-vm-adoption-test
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: kubeadm-vm-adoption-test-control-plane
+
+---
+# KubevirtCluster - infrastructure cluster definition
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtCluster
+metadata:
+  name: kubeadm-vm-adoption-test
+  namespace: vm-lab
+spec:
+  controlPlaneServiceTemplate:
+    spec:
+      type: ClusterIP
+  # KHÔNG CẦN infraClusterSecretRef vì VM ở cùng cluster với CAPI
+
+---
+# KubevirtMachineTemplate cho Control Plane với adoption
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtMachineTemplate
+metadata:
+  name: kubeadm-vm-adoption-test-control-plane
+  namespace: vm-lab
+  annotations:
+    # 🔑 ADOPTION ANNOTATION cho Control Plane VM
+    capk.cluster.x-k8s.io/existing-vm-name: "lab-vm-04"
+spec:
+  template:
+    spec:
+      # Template này chỉ để validation, không tạo VM mới
+      virtualMachineTemplate:
+        metadata:
+          namespace: vm-lab
+        spec:
+          runStrategy: Always
+          template:
+            spec:
+              domain:
+                cpu:
+                  cores: 2
+                memory:
+                  guest: "4Gi"
+                devices:
+                  networkInterfaceMultiqueue: true
+                  disks:
+                    - disk:
+                        bus: virtio
+                      name: rootdisk
+                    - disk:
+                        bus: virtio
+                      name: cloudinit
+                  interfaces:
+                    - masquerade: {}
+                      name: default
+              networks:
+                - name: default
+                  pod: {}
+              volumes:
+                - dataVolume:
+                    name: lab-vm-04-disk
+                  name: rootdisk
+                - cloudInitNoCloud:
+                    userData: "#cloud-config\n# Sẽ được inject CAPI bootstrap data"
+                  name: cloudinit
+      # KHÔNG CẦN infraClusterSecretRef vì VM ở cùng cluster
+
+---
+# KubeadmControlPlane - quản lý control plane lifecycle
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: kubeadm-vm-adoption-test-control-plane
+  namespace: vm-lab
+spec:
+  replicas: 1
+  machineTemplate:
+    infrastructureRef:
+      kind: KubevirtMachineTemplate
+      apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+      name: kubeadm-vm-adoption-test-control-plane
+      namespace: vm-lab
+  kubeadmConfigSpec:
+    # Pre-kubeadm commands để install Kubernetes components
+    preKubeadmCommands:
+      - apt-get update
+      - apt-get install -y apt-transport-https ca-certificates curl gpg
+      - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list
+      - apt-get update
+      - apt-get install -y kubelet=1.28.0-1.1 kubeadm=1.28.0-1.1 kubectl=1.28.0-1.1
+      - apt-mark hold kubelet kubeadm kubectl
+      - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      - apt-get update
+      - apt-get install -y containerd.io
+      - mkdir -p /etc/containerd
+      - containerd config default | tee /etc/containerd/config.toml
+      - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      - systemctl restart containerd
+      - systemctl enable containerd
+    # Cluster configuration cho control plane
+    clusterConfiguration:
+      networking:
+        dnsDomain: "kubeadm-vm-adoption-test.vm-lab.local"
+        podSubnet: 10.243.0.0/16
+        serviceSubnet: 10.95.0.0/16
+      apiServer:
+        extraArgs:
+          cloud-provider: external
+        certSANs:
+          - localhost
+          - 127.0.0.1
+      controllerManager:
+        extraArgs:
+          cloud-provider: external
+    # Init configuration cho first control plane node
+    initConfiguration:
+      nodeRegistration:
+        criSocket: "unix:///var/run/containerd/containerd.sock"
+        kubeletExtraArgs:
+          cloud-provider: external
+          provider-id: "kubevirt://lab-vm-04"
+    # Join configuration cho additional control plane nodes
+    joinConfiguration:
+      nodeRegistration:
+        criSocket: "unix:///var/run/containerd/containerd.sock"
+        kubeletExtraArgs:
+          cloud-provider: external
+          provider-id: "kubevirt://lab-vm-04"
+  version: v1.28.0
+
+---
+# 📝 CONTROL PLANE ONLY TEST
+# Focus vào testing VM adoption và bootstrap injection
+#
+# Control Plane VM:
+#   - Tên: lab-vm-04  
+#   - Namespace: vm-lab
+#   - Status: Running
+#   - Requirements: 2 CPU, 4Gi RAM
+#
+# Để kiểm tra adoption flow:
+# kubectl get kubevirtmachine -n vm-lab
+# kubectl describe kubevirtmachine <machine-name> -n vm-lab
+#
+# Để kiểm tra bootstrap injection:
+# kubectl get vm lab-vm-04 -n vm-lab -o jsonpath='{.spec.template.spec.volumes[?(@.name=="cloudinit")].cloudInitNoCloud.userData}' | base64 -d

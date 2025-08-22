@@ -1,0 +1,263 @@
+# CAPI Spec để adopt VM có sẵn cho cả Control Plane và Worker
+# Control Plane: sử dụng KubeadmControlPlane provider
+# Worker: sử dụng MachineDeployment
+# VM đang ở managed cluster (cùng cluster với CAPI) - KHÔNG CẦN infraClusterSecretRef
+
+---
+# Cluster resource - định nghĩa toàn bộ cluster
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: kubeadm-existing-vm-test
+  namespace: vm-lab
+  labels:
+    cluster-type: existing-vm-adoption
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+        - 10.243.0.0/16
+    services:
+      cidrBlocks:
+        - 10.95.0.0/16
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+    kind: KubevirtCluster
+    name: kubeadm-existing-vm-test
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: kubeadm-existing-vm-test-control-plane
+
+---
+# KubevirtCluster - infrastructure cluster definition
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtCluster
+metadata:
+  name: kubeadm-existing-vm-test
+  namespace: vm-lab
+spec:
+  controlPlaneServiceTemplate:
+    spec:
+      type: ClusterIP
+  # KHÔNG CẦN infraClusterSecretRef vì VM ở cùng cluster với CAPI
+
+---
+# KubevirtMachineTemplate cho Control Plane với adoption
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtMachineTemplate
+metadata:
+  name: kubeadm-existing-vm-test-control-plane
+  namespace: vm-lab
+  annotations:
+    # 🔑 ADOPTION ANNOTATION cho Control Plane VM
+    capk.cluster.x-k8s.io/existing-vm-name: "lab-vm-04"
+spec:
+  template:
+    spec:
+      # Template này chỉ để validation, không tạo VM mới
+      virtualMachineTemplate:
+        metadata:
+          namespace: vm-lab
+        spec:
+          runStrategy: Always
+          template:
+            spec:
+              domain:
+                cpu:
+                  cores: 2
+                memory:
+                  guest: "4Gi"
+                devices:
+                  networkInterfaceMultiqueue: true
+                  disks:
+                    - disk:
+                        bus: virtio
+                      name: rootdisk
+                    - disk:
+                        bus: virtio
+                      name: cloudinit
+                  interfaces:
+                    - masquerade: {}
+                      name: default
+              networks:
+                - name: default
+                  pod: {}
+              volumes:
+                - dataVolume:
+                    name: lab-vm-04-disk
+                  name: rootdisk
+                - cloudInitNoCloud:
+                    userData: "#cloud-config\n# Sẽ được inject CAPI bootstrap data"
+                  name: cloudinit
+      # KHÔNG CẦN infraClusterSecretRef vì VM ở cùng cluster
+
+---
+# KubeadmControlPlane - quản lý control plane lifecycle
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: kubeadm-existing-vm-test-control-plane
+  namespace: vm-lab
+spec:
+  replicas: 0
+  machineTemplate:
+    infrastructureRef:
+      kind: KubevirtMachineTemplate
+      apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+      name: kubeadm-existing-vm-test-control-plane
+      namespace: vm-lab
+  kubeadmConfigSpec:
+    # Cluster configuration cho control plane
+    clusterConfiguration:
+      networking:
+        dnsDomain: "kubeadm-existing-vm-test.default.local"
+        podSubnet: 10.243.0.0/16
+        serviceSubnet: 10.95.0.0/16
+      apiServer:
+        extraArgs:
+          cloud-provider: external
+        certSANs:
+          - localhost
+          - 127.0.0.1
+      controllerManager:
+        extraArgs:
+          cloud-provider: external
+    # Init configuration cho first control plane node
+    initConfiguration:
+      nodeRegistration:
+        criSocket: "unix:///var/run/containerd/containerd.sock"
+        kubeletExtraArgs:
+          cloud-provider: external
+          provider-id: "kubevirt://lab-vm-04"
+    # Join configuration cho additional control plane nodes
+    joinConfiguration:
+      nodeRegistration:
+        criSocket: "unix:///var/run/containerd/containerd.sock"
+        kubeletExtraArgs:
+          cloud-provider: external
+          provider-id: "kubevirt://lab-vm-04"
+  version: v1.28.0
+
+---
+# KubevirtMachineTemplate cho Worker nodes với adoption
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtMachineTemplate
+metadata:
+  name: kubeadm-existing-vm-test-worker
+  namespace: vm-lab
+  annotations:
+    # 🔑 ADOPTION ANNOTATION cho Worker VM
+    capk.cluster.x-k8s.io/existing-vm-name: "lab-vm-03"
+spec:
+  template:
+    spec:
+      virtualMachineTemplate:
+        metadata:
+          namespace: vm-lab
+        spec:
+          runStrategy: Always
+          template:
+            spec:
+              domain:
+                cpu:
+                  cores: 2
+                memory:
+                  guest: "4Gi"
+                devices:
+                  networkInterfaceMultiqueue: true
+                  disks:
+                    - disk:
+                        bus: virtio
+                      name: rootdisk
+                    - disk:
+                        bus: virtio
+                      name: cloudinit
+                  interfaces:
+                    - masquerade: {}
+                      name: default
+              networks:
+                - name: default
+                  pod: {}
+              volumes:
+                - dataVolume:
+                    name: lab-vm-03-disk
+                  name: rootdisk
+                - cloudInitNoCloud:
+                    userData: "#cloud-config\n# Sẽ được inject CAPI bootstrap data"
+                  name: cloudinit
+      # KHÔNG CẦN infraClusterSecretRef vì VM ở cùng cluster
+
+---
+# KubeadmConfigTemplate cho Worker bootstrap
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfigTemplate
+metadata:
+  name: kubeadm-existing-vm-test-worker
+  namespace: vm-lab
+spec:
+  template:
+    spec:
+      joinConfiguration:
+        nodeRegistration:
+          criSocket: "unix:///var/run/containerd/containerd.sock"
+          kubeletExtraArgs:
+            cloud-provider: external
+            provider-id: "kubevirt://lab-vm-03"
+
+---
+# MachineDeployment cho Worker nodes
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: kubeadm-existing-vm-test-worker
+  namespace: vm-lab
+spec:
+  clusterName: kubeadm-existing-vm-test
+  replicas: 0
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: kubeadm-existing-vm-test
+      cluster.x-k8s.io/deployment-name: worker-existing-vm
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: kubeadm-existing-vm-test
+        cluster.x-k8s.io/deployment-name: worker-existing-vm
+    spec:
+      clusterName: kubeadm-existing-vm-test
+      version: v1.28.0
+      bootstrap:
+        configRef:
+          name: kubeadm-existing-vm-test-worker
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+      infrastructureRef:
+        name: kubeadm-existing-vm-test-worker
+        apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+        kind: KubevirtMachineTemplate
+
+---
+# 📝 VM MAPPING DOCUMENTATION
+# Bạn cần đảm bảo các VM sau đã có sẵn và đang chạy:
+#
+# Control Plane VM:
+#   - Tên: lab-vm-04
+#   - Namespace: default (hoặc namespace hiện tại)
+#   - Status: Running
+#   - Requirements: 2 CPU, 4Gi RAM, guest agent
+#
+# Worker VM:
+#   - Tên: lab-vm-03
+#   - Namespace: default (hoặc namespace hiện tại)
+#   - Status: Running
+#   - Requirements: 2 CPU, 4Gi RAM, guest agent
+#
+# Để kiểm tra VM có sẵn:
+# kubectl get vm lab-vm-04 lab-vm-03 -n <namespace>
+#
+# Để kiểm tra VM status:
+# kubectl get vm <vm-name> -n <namespace> -o yaml
+#
+# QUAN TRỌNG: Sau khi apply, CAPI sẽ tự generate kubeconfig cho workload cluster:
+# clusterctl get kubeconfig kubeadm-existing-vm-test --namespace default > workload-cluster.kubeconfig

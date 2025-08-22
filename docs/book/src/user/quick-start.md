@@ -1273,7 +1273,7 @@ clusterctl generate cluster --infrastructure nutanix --list-variables capi-quick
 
 ```bash
 # OpenNebula API endpoint and credentials
-export ONE_XMLRPC='http://10.2.11.40:2633/RPC2'
+export ONE_XMLRPC='http://10.2.11.40: '
 export ONE_AUTH='oneadmin:opennebula'
 
 # VM and VR templates to construct workload clusters from
