@@ -1,0 +1,70 @@
+on: [push, pull_request]
+name: build
+jobs:
+  unit_test:
+    if: (github.repository == 'kubernetes-sigs/cluster-api-provider-kubevirt')
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    - name: Install Go
+      uses: actions/setup-go@v4
+      with:
+        go-version-file: go.mod
+    - name: Test
+      run: make test
+    - name: Build
+      run: make manager
+
+  coverage:
+    if: (github.repository == 'kubernetes-sigs/cluster-api-provider-kubevirt')
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+    - name: Test with coverage
+      env:
+        TEST_ARGS: -covermode atomic -outputdir=./coverprofiles -coverprofile=cover.coverprofile
+      run: |-
+        mkdir -p coverprofiles
+        make test
+    - name: Push to coveralls.io
+      env:
+        COVERALLS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |-
+        go install github.com/mattn/goveralls@latest
+        $(go env GOPATH)/bin/goveralls -coverprofile=coverprofiles/cover.coverprofile -service=github
+
+  go-linter:
+    if: github.repository == 'kubernetes-sigs/cluster-api-provider-kubevirt'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+    - name: golangci-lint
+      uses: golangci/golangci-lint-action@v6
+      with:
+        args: --timeout=5m -v
+        version: v1.63.4
+
+  check-gen:
+    if: github.repository == 'kubernetes-sigs/cluster-api-provider-kubevirt'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+    - name: Check that 'make generate' has being call
+      run: make check-gen

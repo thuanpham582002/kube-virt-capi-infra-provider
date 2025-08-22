@@ -1,0 +1,29 @@
+on:
+  push:
+    branches:
+    - main
+    paths:
+    - clusterkubevirtadm/**
+  pull_request:
+    paths:
+    - clusterkubevirtadm/**
+name: test-clusterkubevirtadm
+jobs:
+  clusterkubevirtadm-unit_test:
+    if: github.repository == 'kubernetes-sigs/cluster-api-provider-kubevirt'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    - name: Install Go
+      uses: actions/setup-go@v4
+      with:
+        go-version-file: go.mod
+    - name: Test
+      run: make clusterkubevirtadm-test
+    - name: Build for linux
+      run: make clusterkubevirtadm-linux
+    - name: Build for macos
+      run: make clusterkubevirtadm-macos
+    - name: Build for windows
+      run: make clusterkubevirtadm-win

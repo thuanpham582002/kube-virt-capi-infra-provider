@@ -1,0 +1,56 @@
+on:
+  push:
+    tags:
+      - "v*"
+
+name: Upload Release Asset
+
+jobs:
+  build-and-push-image:
+    if: github.repository == 'kubernetes-sigs/cluster-api-provider-kubevirt'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+      - name: build image
+        shell: bash
+        env:
+          QUAY_TOKEN: ${{secrets.QUAY_TOKEN}}
+          REGISTRY: "quay.io/capk"
+          TAG: ${{ github.ref_name }}
+        run: |
+          echo $QUAY_TOKEN | docker login -u="capk+capk_robot" quay.io --password-stdin
+          make docker-build-all
+          make docker-push-all
+  build:
+    if: github.repository == 'kubernetes-sigs/cluster-api-provider-kubevirt'
+    name: Upload Release Asset
+    needs: build-and-push-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: go.mod
+      - name: Install kustomize
+        run: curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+      - name: Create infrastructure components
+        env:
+          REGISTRY: "quay.io/capk"
+          IMAGE_NAME: "capk-manager"
+          TAG: ${{ github.ref_name }}
+        run: |
+          make create-infrastructure-components
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: | 
+            infrastructure-components.yaml
+            metadata.yaml
+            templates/*.yaml

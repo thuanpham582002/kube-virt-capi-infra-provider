@@ -1,0 +1,19 @@
+linters-settings:
+  ginkgolinter:
+    forbid-focus-container: true
+
+linters:
+  enable:
+    - errcheck
+    - ginkgolinter
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - typecheck
+    - unused
+  disable: []
+
+issues:
+  exclude:
+    - SA1019 # todo remove the exclude parameter when issue #85 is resolved
