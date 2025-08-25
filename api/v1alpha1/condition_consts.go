@@ -59,6 +59,24 @@ const (
 	BootstrapFailedReason = "BootstrapFailed"
 )
 
+// Adoption phase constants for existing VM adoption workflow
+const (
+	// Adoption phases
+	AdoptionPhaseNone           = ""
+	AdoptionPhaseDetected       = "detected"
+	AdoptionPhaseLabelsApplied  = "labels-applied"
+	AdoptionPhaseBootstrapping  = "bootstrapping" 
+	AdoptionPhaseCompleted      = "completed"
+	AdoptionPhaseFailed         = "failed"
+	
+	// Adoption condition reasons
+	AdoptionInProgressReason         = "AdoptionInProgress"
+	ExistingVMAdoptionFailedReason   = "ExistingVMAdoptionFailed"
+	BootstrapInjectionInProgressReason = "BootstrapInjectionInProgress"
+	BootstrapInjectionFailedReason   = "BootstrapInjectionFailed"
+	AdoptedVMBootstrappingReason     = "AdoptedVMBootstrapping"
+)
+
 // Conditions and condition Reasons for the KubevirtCluster object
 
 const (

@@ -8,5 +8,5 @@ spec:
     spec:
       containers:
       # Change the value of image field below to your controller image URL
-      - image: controller
+      - image: ghcr.io/thuanpham582002/cluster-api-kubevirt-controller-amd64:latest
         name: manager

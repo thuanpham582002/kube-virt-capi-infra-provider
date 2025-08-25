@@ -1,0 +1,201 @@
+# Example: Adopting an existing KubeVirt VM into CAPI management
+#
+# This example shows how to adopt an existing VM named "lab-vm-01" 
+# from the "vm-lab" namespace into CAPI management as a worker node.
+
+---
+# 1. KubeadmConfig for bootstrap
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfig
+metadata:
+  name: existing-worker-1
+  namespace: default
+spec:
+  joinConfiguration:
+    nodeRegistration:
+      criSocket: unix:///var/run/containerd/containerd.sock
+      kubeletExtraArgs:
+        cloud-provider: external
+        provider-id: "kubevirt://existing-worker-1"
+
+---
+# 2. KubevirtMachine with adoption annotation
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtMachine
+metadata:
+  name: existing-worker-1
+  namespace: default
+  annotations:
+    # This annotation tells the controller to adopt existing VM "lab-vm-01"
+    capk.cluster.x-k8s.io/existing-vm-name: "lab-vm-01"
+spec:
+  # Virtual machine template - used for validation only during adoption
+  virtualMachineTemplate:
+    spec:
+      runStrategy: Always
+      template:
+        spec:
+          domain:
+            cpu:
+              cores: 1
+            devices:
+              disks:
+              - disk:
+                  bus: virtio
+                name: rootdisk
+              - disk:
+                  bus: virtio
+                name: cloudinit
+              interfaces:
+              - masquerade: {}
+                name: default
+            resources:
+              requests:
+                cpu: "1"
+                memory: 2Gi
+          networks:
+          - name: default
+            pod: {}
+          volumes:
+          - dataVolume:
+              name: existing-worker-1-disk
+            name: rootdisk
+          - cloudInitNoCloud:
+              userData: "#cloud-config\n# This will be replaced with CAPI bootstrap data"
+            name: cloudinit
+  
+  # Reference to external cluster where the VM exists
+  infraClusterSecretRef:
+    name: vm-lab-kubeconfig
+    namespace: default
+
+---
+# 3. Machine resource
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Machine
+metadata:
+  name: existing-worker-1
+  namespace: default
+  labels:
+    cluster.x-k8s.io/cluster-name: my-cluster
+    cluster.x-k8s.io/control-plane: ""
+spec:
+  clusterName: my-cluster
+  bootstrap:
+    configRef:
+      apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+      kind: KubeadmConfig
+      name: existing-worker-1
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+    kind: KubevirtMachine
+    name: existing-worker-1
+
+---
+# 4. Secret with kubeconfig for external cluster (vm-lab namespace)
+# This should point to the cluster where "lab-vm-01" VM exists
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vm-lab-kubeconfig
+  namespace: default
+type: Opaque
+data:
+  # Base64 encoded kubeconfig that has access to vm-lab namespace
+  # kubectl config view --raw | base64 -w 0
+  value: <BASE64_ENCODED_KUBECONFIG>
+
+---
+# Example of what the existing VM looks like (for reference)
+# This VM will be adopted into CAPI management
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: lab-vm-01
+  namespace: vm-lab
+  labels:
+    kubevirt.io/vm: lab-vm-01
+    # After adoption, these labels will be added:
+    # cluster.x-k8s.io/cluster-name: my-cluster
+    # cluster.x-k8s.io/role: worker
+    # capk.cluster.x-k8s.io/kubevirt-machine-name: existing-worker-1
+    # capk.cluster.x-k8s.io/kubevirt-machine-namespace: default
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: lab-vm-01
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        devices:
+          disks:
+          - disk:
+              bus: virtio
+            name: rootdisk
+          - disk:
+              bus: virtio
+            name: cloudinit
+          interfaces:
+          - masquerade: {}
+            name: default
+        resources:
+          requests:
+            cpu: "1"
+            memory: 2Gi
+      networks:
+      - name: default
+        pod: {}
+      volumes:
+      - dataVolume:
+          name: lab-vm-01-disk
+        name: rootdisk
+      - cloudInitNoCloud:
+          userData: |
+            #cloud-config
+            user: ubuntu
+            password: ubuntu123
+            chpasswd: 
+              list: |
+                ubuntu:ubuntu123
+                root:ubuntu123
+              expire: False
+            ssh_pwauth: True
+            sudo: ALL=(ALL) NOPASSWD:ALL
+            lock_passwd: False
+            
+            # Package management
+            package_update: true
+            package_upgrade: true
+            packages:
+              - qemu-guest-agent
+              - curl
+              - wget
+              - git
+              - vim
+              - htop
+              - net-tools
+              - build-essential
+            
+            runcmd:
+              # Enable and start guest agent
+              - systemctl enable qemu-guest-agent
+              - systemctl start qemu-guest-agent
+              
+            final_message: "VM lab-vm-01 is ready for CAPI adoption!"
+        name: cloudinit
+status:
+  conditions:
+  - lastProbeTime: null
+    lastTransitionTime: "2025-08-19T08:52:45Z"
+    status: "True"
+    type: Ready
+  - lastProbeTime: "2025-08-19T08:55:01Z"
+    lastTransitionTime: null
+    status: "True"
+    type: AgentConnected
+  created: true
+  printableStatus: Running
+  ready: true

@@ -52,14 +52,14 @@ KUSTOMIZE_IMAGE = registry.k8s.io/kustomize/kustomize:v3.8.7
 KUSTOMIZE ?= docker run $(KUSTOMIZE_IMAGE)
 
 # Define Docker related variables. Releases should modify and double check these vars.
-REGISTRY ?= 127.0.0.1:5000
-IMAGE_NAME ?= capk-manager
+REGISTRY ?= ghcr.io/thuanpham582002
+IMAGE_NAME ?= cluster-api-kubevirt-controller
 CONTROLLER_IMG ?= $(REGISTRY)/$(IMAGE_NAME)
 ARCH ?= amd64
 ALL_ARCH = amd64 arm arm64
 
 # TAG is set to GIT_TAG in GCB, a git-based tag of the form vYYYYMMDD-hash, e.g., v20210120-v0.3.10-308-gc61521971.
-TAG ?= dev
+TAG ?= latest
 
 # Allow overriding the imagePullPolicy
 PULL_POLICY ?= Always

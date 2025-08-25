@@ -43,6 +43,20 @@ type MachineInterface interface {
 
 	// GetVMUnscheduledReason returns the reason and message for the condition, if the VM is not ready
 	GetVMNotReadyReason() (string, string)
+
+	// AdoptExistingVM adopts an existing VM into CAPI management
+	AdoptExistingVM(ctx gocontext.Context, vmName string) error
+	// IsAdoptedVM checks if this machine represents an adopted existing VM
+	IsAdoptedVM() bool
+	// RestartVMWithBootstrap stops and starts VM to inject bootstrap data
+	RestartVMWithBootstrap(ctx gocontext.Context) error
+	
+	// Adoption state management methods
+	NeedsAdoption() bool
+	IsAdoptionInProgress() bool
+	IsAdoptionFailed() bool
+	GetAdoptionPhase() string
+	SetAdoptionPhase(phase string) error
 }
 
 // MachineFactory allows creating new instances of kubevirt.machine

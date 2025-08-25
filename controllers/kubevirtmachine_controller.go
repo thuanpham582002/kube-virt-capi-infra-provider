@@ -81,6 +81,19 @@ func (r *KubevirtMachineReconciler) Reconcile(goctx gocontext.Context, req ctrl.
 		return ctrl.Result{}, err
 	}
 
+	// Check and copy adoption annotation from template if missing
+	if err := r.ensureAdoptionAnnotationFromTemplate(goctx, kubevirtMachine); err != nil {
+		log.Error(err, "Failed to ensure adoption annotation from template")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// Re-fetch the kubevirtMachine after potential annotation update
+	updatedKubevirtMachine := &infrav1.KubevirtMachine{}
+	if err := r.Client.Get(goctx, req.NamespacedName, updatedKubevirtMachine); err != nil {
+		return ctrl.Result{}, err
+	}
+	kubevirtMachine = updatedKubevirtMachine
+
 	// Fetch the Machine.
 	machine, err := util.GetOwnerMachine(goctx, r.Client, kubevirtMachine.ObjectMeta)
 	if err != nil {
@@ -214,15 +227,35 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 		}
 	}
 
-	// Default the infra cluster secret ref when the
-	// machine does not have one set.
-	if ctx.KubevirtMachine.Spec.InfraClusterSecretRef == nil {
-		ctx.KubevirtMachine.Spec.InfraClusterSecretRef = ctx.KubevirtCluster.Spec.InfraClusterSecretRef
-	}
+	// Check for same-cluster adoption - skip kubeconfig complexity
+	existingVMName := getExistingVMAnnotation(ctx.KubevirtMachine)
+	isSameClusterAdoption := existingVMName != "" && ctx.KubevirtMachine.Spec.InfraClusterSecretRef == nil && ctx.KubevirtCluster.Spec.InfraClusterSecretRef == nil
 
-	infraClusterClient, infraClusterNamespace, err := r.InfraCluster.GenerateInfraClusterClient(ctx.KubevirtMachine.Spec.InfraClusterSecretRef, ctx.KubevirtMachine.Namespace, ctx.Context)
-	if err != nil {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to generate infra cluster client")
+	var infraClusterClient client.Client
+	var infraClusterNamespace string
+	var err error
+
+	if isSameClusterAdoption {
+		// For same-cluster adoption, use current cluster client
+		infraClusterClient = r.Client
+		infraClusterNamespace = ctx.KubevirtMachine.Namespace
+		ctx.Logger.Info("Using same-cluster adoption mode - no kubeconfig needed")
+	} else {
+		// Default the infra cluster secret ref when the
+		// machine does not have one set.
+		if ctx.KubevirtMachine.Spec.InfraClusterSecretRef == nil {
+			ctx.KubevirtMachine.Spec.InfraClusterSecretRef = ctx.KubevirtCluster.Spec.InfraClusterSecretRef
+		}
+
+		infraClusterClient, infraClusterNamespace, err = r.InfraCluster.GenerateInfraClusterClient(ctx.KubevirtMachine.Spec.InfraClusterSecretRef, ctx.KubevirtMachine.Namespace, ctx.Context)
+		if err != nil {
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to generate infra cluster client")
+		}
+
+		if infraClusterClient == nil {
+			ctx.Logger.Info("Waiting for infra cluster client...")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 	}
 
 	// If there is not a namespace explicitly set on the vm template, then
@@ -233,11 +266,6 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 	vmNamespace := ctx.KubevirtMachine.Spec.VirtualMachineTemplate.ObjectMeta.Namespace
 	if vmNamespace == "" {
 		vmNamespace = infraClusterNamespace
-	}
-
-	if infraClusterClient == nil {
-		ctx.Logger.Info("Waiting for infra cluster client...")
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	if err := r.reconcileKubevirtBootstrapSecret(ctx, infraClusterClient, vmNamespace, clusterNodeSshKeys); err != nil {
@@ -261,8 +289,14 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 		ctx.KubevirtMachine.Status.FailureMessage = &terminalReason
 	}
 
-	// Provision the underlying VM if not existing
+	// Handle existing VM adoption with state machine
+	if result, err := r.handleVMAdoption(ctx, externalMachine); err != nil || !result.IsZero() {
+		return result, err
+	}
+
+	// Handle regular VM creation if not adoption case
 	if !isTerminal && !externalMachine.Exists() {
+		// Original VM creation logic
 		ctx.KubevirtMachine.Status.Ready = false
 		if err := externalMachine.Create(ctx.Context); err != nil {
 			conditions.MarkFalse(ctx.KubevirtMachine, infrav1.VMProvisionedCondition, infrav1.VMCreateFailedReason, clusterv1.ConditionSeverityError, "Failed vm creation: %v", err)
@@ -272,17 +306,27 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 		return ctrl.Result{RequeueAfter: 20 * time.Second}, nil
 	}
 
-	// Checks to see if a VM's active VMI is ready or not
+	// Enhanced VM readiness check with adoption awareness
 	if externalMachine.IsReady() {
 		// Mark VMProvisionedCondition to indicate that the VM has successfully started
 		conditions.MarkTrue(ctx.KubevirtMachine, infrav1.VMProvisionedCondition)
+		ctx.Logger.Info("VM is ready and provisioned")
 	} else {
 		reason, message := externalMachine.GetVMNotReadyReason()
-		conditions.MarkFalse(ctx.KubevirtMachine, infrav1.VMProvisionedCondition, reason, clusterv1.ConditionSeverityInfo, "%s", message)
+		
+		// Check if this is an adopted VM still in bootstrap process
+		if existingVMName := getExistingVMAnnotation(ctx.KubevirtMachine); existingVMName != "" {
+			ctx.Logger.Info("Adopted VM not ready yet, continuing bootstrap process", "vm", existingVMName, "reason", reason)
+			conditions.MarkFalse(ctx.KubevirtMachine, infrav1.VMProvisionedCondition, 
+				"AdoptedVMBootstrapping", clusterv1.ConditionSeverityInfo, 
+				"Adopted VM %s bootstrapping: %s", existingVMName, message)
+		} else {
+			conditions.MarkFalse(ctx.KubevirtMachine, infrav1.VMProvisionedCondition, reason, clusterv1.ConditionSeverityInfo, "%s", message)
+		}
 
 		// Waiting for VM to boot
 		ctx.KubevirtMachine.Status.Ready = false
-		ctx.Logger.Info("KubeVirt VM is not fully provisioned and running...")
+		ctx.Logger.Info("KubeVirt VM is not fully provisioned and running...", "reason", reason)
 		return ctrl.Result{RequeueAfter: 20 * time.Second}, nil
 	}
 
@@ -311,16 +355,25 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 		return ctrl.Result{RequeueAfter: retryDuration}, nil
 	}
 
+	// Enhanced bootstrap checking with adoption awareness
 	if externalMachine.SupportsCheckingIsBootstrapped() && !conditions.IsTrue(ctx.KubevirtMachine, infrav1.BootstrapExecSucceededCondition) {
 		if !externalMachine.IsBootstrapped() {
-			ctx.Logger.Info("Waiting for underlying VM to bootstrap...")
-			conditions.MarkFalse(ctx.KubevirtMachine, infrav1.BootstrapExecSucceededCondition, infrav1.BootstrapFailedReason, clusterv1.ConditionSeverityWarning, "VM not bootstrapped yet")
+			// Check if this is an adopted VM
+			if existingVMName := getExistingVMAnnotation(ctx.KubevirtMachine); existingVMName != "" {
+				ctx.Logger.Info("Waiting for adopted VM to complete bootstrap process...", "vm", existingVMName)
+				conditions.MarkFalse(ctx.KubevirtMachine, infrav1.BootstrapExecSucceededCondition, 
+					"AdoptedVMBootstrapping", clusterv1.ConditionSeverityInfo, 
+					"Adopted VM %s running bootstrap scripts", existingVMName)
+			} else {
+				ctx.Logger.Info("Waiting for underlying VM to bootstrap...")
+				conditions.MarkFalse(ctx.KubevirtMachine, infrav1.BootstrapExecSucceededCondition, infrav1.BootstrapFailedReason, clusterv1.ConditionSeverityWarning, "VM not bootstrapped yet")
+			}
 			ctx.KubevirtMachine.Status.Ready = false
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
 		// Update the condition BootstrapExecSucceededCondition
 		conditions.MarkTrue(ctx.KubevirtMachine, infrav1.BootstrapExecSucceededCondition)
-		ctx.Logger.Info("Underlying VM has boostrapped.")
+		ctx.Logger.Info("Underlying VM has bootstrapped successfully")
 	}
 
 	ctx.KubevirtMachine.Status.Addresses = []clusterv1.MachineAddress{
@@ -353,9 +406,12 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 		ctx.KubevirtMachine.Spec.ProviderID = &providerID
 	}
 
-	// Ready should reflect if the VMI is ready or not
+	// Ready should reflect if the VMI is ready or not with adoption status
 	if externalMachine.IsReady() {
 		ctx.KubevirtMachine.Status.Ready = true
+		if existingVMName := getExistingVMAnnotation(ctx.KubevirtMachine); existingVMName != "" {
+			ctx.Logger.Info("Adopted VM is now ready and fully operational", "vm", existingVMName)
+		}
 	} else {
 		ctx.KubevirtMachine.Status.Ready = false
 	}
@@ -386,19 +442,40 @@ func machineHasKnownInternalIP(kubevirtMachine *infrav1.KubevirtMachine) bool {
 	return false
 }
 
+// getExistingVMAnnotation retrieves the existing VM name from annotations
+func getExistingVMAnnotation(machine *infrav1.KubevirtMachine) string {
+	if machine.Annotations == nil {
+		return ""
+	}
+	return machine.Annotations[infrav1.ExistingVMName]
+}
+
 func (r *KubevirtMachineReconciler) updateNodeProviderID(ctx *context.MachineContext) (ctrl.Result, error) {
 	// If the provider ID is already updated on the Node, return
 	if ctx.KubevirtMachine.Status.NodeUpdated {
 		return ctrl.Result{}, nil
 	}
 
-	workloadClusterClient, err := r.WorkloadCluster.GenerateWorkloadClusterClient(ctx)
-	if err != nil {
-		ctx.Logger.Error(err, "Workload cluster client is not available")
-	}
-	if workloadClusterClient == nil {
-		ctx.Logger.Info("Waiting for workload cluster client...")
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	// Check for same-cluster adoption - skip workload cluster client
+	existingVMName := getExistingVMAnnotation(ctx.KubevirtMachine)
+	isSameClusterAdoption := existingVMName != "" && ctx.KubevirtMachine.Spec.InfraClusterSecretRef == nil && ctx.KubevirtCluster.Spec.InfraClusterSecretRef == nil
+
+	var workloadClusterClient client.Client
+	var err error
+
+	if isSameClusterAdoption {
+		// For same-cluster adoption, use current cluster client
+		workloadClusterClient = r.Client
+		ctx.Logger.Info("Using same-cluster client for node provider ID update")
+	} else {
+		workloadClusterClient, err = r.WorkloadCluster.GenerateWorkloadClusterClient(ctx)
+		if err != nil {
+			ctx.Logger.Error(err, "Workload cluster client is not available")
+		}
+		if workloadClusterClient == nil {
+			ctx.Logger.Info("Waiting for workload cluster client...")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 	}
 
 	// using workload cluster client, get the corresponding cluster node
@@ -431,6 +508,199 @@ func (r *KubevirtMachineReconciler) updateNodeProviderID(ctx *context.MachineCon
 	ctx.KubevirtMachine.Status.NodeUpdated = true
 
 	return ctrl.Result{}, nil
+}
+
+// handleVMAdoption manages the VM adoption state machine
+func (r *KubevirtMachineReconciler) handleVMAdoption(ctx *context.MachineContext, externalMachine kubevirt.MachineInterface) (ctrl.Result, error) {
+	// Check if this is an adoption case
+	if !externalMachine.NeedsAdoption() && !externalMachine.IsAdoptionInProgress() {
+		// Not an adoption case - continue with normal flow
+		return ctrl.Result{}, nil
+	}
+
+	existingVMName := getExistingVMAnnotation(ctx.KubevirtMachine)
+	if existingVMName == "" {
+		// No annotation found but adoption state suggests there should be one
+		ctx.Logger.Info("Adoption state detected but no existing VM annotation found - clearing adoption state")
+		// Clear any stale adoption state
+		externalMachine.SetAdoptionPhase(infrav1.AdoptionPhaseNone)
+		return ctrl.Result{}, nil
+	}
+
+	phase := externalMachine.GetAdoptionPhase()
+	ctx.Logger.Info("Handling VM adoption", "vm", existingVMName, "phase", phase)
+
+	switch phase {
+	case infrav1.AdoptionPhaseNone:
+		return r.startAdoption(ctx, externalMachine, existingVMName)
+	
+	case infrav1.AdoptionPhaseDetected, infrav1.AdoptionPhaseLabelsApplied:
+		return r.injectBootstrap(ctx, externalMachine, existingVMName)
+	
+	case infrav1.AdoptionPhaseBootstrapping:
+		return r.monitorBootstrap(ctx, externalMachine, existingVMName)
+	
+	case infrav1.AdoptionPhaseFailed:
+		return r.handleAdoptionFailure(ctx, externalMachine, existingVMName)
+	
+	case infrav1.AdoptionPhaseCompleted:
+		// Adoption is complete - continue with normal reconciliation
+		ctx.Logger.Info("VM adoption completed successfully", "vm", existingVMName)
+		return ctrl.Result{}, nil
+	
+	default:
+		ctx.Logger.Info("Unknown adoption phase, resetting to none", "phase", phase)
+		externalMachine.SetAdoptionPhase(infrav1.AdoptionPhaseNone)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+}
+
+// startAdoption begins the adoption process
+func (r *KubevirtMachineReconciler) startAdoption(ctx *context.MachineContext, externalMachine kubevirt.MachineInterface, vmName string) (ctrl.Result, error) {
+	ctx.Logger.Info("Starting VM adoption", "vm", vmName)
+	
+	conditions.MarkFalse(ctx.KubevirtMachine, infrav1.VMProvisionedCondition, 
+		infrav1.AdoptionInProgressReason, clusterv1.ConditionSeverityInfo, 
+		"Adopting existing VM: %s", vmName)
+	
+	if err := externalMachine.AdoptExistingVM(ctx.Context, vmName); err != nil {
+		conditions.MarkFalse(ctx.KubevirtMachine, infrav1.VMProvisionedCondition, 
+			infrav1.ExistingVMAdoptionFailedReason, clusterv1.ConditionSeverityError, 
+			"Failed to adopt existing VM: %v", err)
+		ctx.Logger.Error(err, "VM adoption failed, will retry")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	
+	ctx.Logger.Info("VM adoption successful, proceeding with bootstrap injection")
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// injectBootstrap handles bootstrap injection phase
+func (r *KubevirtMachineReconciler) injectBootstrap(ctx *context.MachineContext, externalMachine kubevirt.MachineInterface, vmName string) (ctrl.Result, error) {
+	ctx.Logger.Info("Injecting bootstrap data", "vm", vmName)
+	
+	conditions.MarkFalse(ctx.KubevirtMachine, infrav1.VMProvisionedCondition, 
+		infrav1.BootstrapInjectionInProgressReason, clusterv1.ConditionSeverityInfo, 
+		"Injecting bootstrap data into adopted VM")
+	
+	if err := externalMachine.RestartVMWithBootstrap(ctx.Context); err != nil {
+		conditions.MarkFalse(ctx.KubevirtMachine, infrav1.VMProvisionedCondition, 
+			infrav1.BootstrapInjectionFailedReason, clusterv1.ConditionSeverityError, 
+			"Failed to restart VM with bootstrap data: %v", err)
+		ctx.Logger.Error(err, "Bootstrap injection failed, will retry")
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	}
+	
+	ctx.Logger.Info("Bootstrap injection completed, monitoring for success")
+	return ctrl.Result{RequeueAfter: 20 * time.Second}, nil
+}
+
+// monitorBootstrap monitors bootstrap completion
+func (r *KubevirtMachineReconciler) monitorBootstrap(ctx *context.MachineContext, externalMachine kubevirt.MachineInterface, vmName string) (ctrl.Result, error) {
+	ctx.Logger.Info("Monitoring bootstrap progress", "vm", vmName)
+	
+	// Check if bootstrap has completed successfully
+	if conditions.IsTrue(ctx.KubevirtMachine, infrav1.BootstrapExecSucceededCondition) {
+		ctx.Logger.Info("Bootstrap completed successfully, marking adoption as complete")
+		externalMachine.SetAdoptionPhase(infrav1.AdoptionPhaseCompleted)
+		conditions.MarkTrue(ctx.KubevirtMachine, infrav1.VMProvisionedCondition)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	
+	// Check if VM is ready and bootstrap can be verified
+	if externalMachine.IsReady() {
+		conditions.MarkFalse(ctx.KubevirtMachine, infrav1.VMProvisionedCondition, 
+			infrav1.AdoptedVMBootstrappingReason, clusterv1.ConditionSeverityInfo, 
+			"Adopted VM %s running bootstrap scripts", vmName)
+	} else {
+		_, message := externalMachine.GetVMNotReadyReason()
+		conditions.MarkFalse(ctx.KubevirtMachine, infrav1.VMProvisionedCondition, 
+			infrav1.AdoptedVMBootstrappingReason, clusterv1.ConditionSeverityInfo, 
+			"Adopted VM %s bootstrapping: %s", vmName, message)
+	}
+	
+	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+}
+
+// handleAdoptionFailure handles failed adoption attempts
+func (r *KubevirtMachineReconciler) handleAdoptionFailure(ctx *context.MachineContext, externalMachine kubevirt.MachineInterface, vmName string) (ctrl.Result, error) {
+	ctx.Logger.Info("Handling adoption failure", "vm", vmName)
+	
+	// For now, retry adoption after a longer delay
+	// TODO: Implement retry limits and fallback to new VM creation
+	ctx.Logger.Info("Retrying failed adoption", "vm", vmName)
+	externalMachine.SetAdoptionPhase(infrav1.AdoptionPhaseNone)
+	
+	conditions.MarkFalse(ctx.KubevirtMachine, infrav1.VMProvisionedCondition, 
+		infrav1.ExistingVMAdoptionFailedReason, clusterv1.ConditionSeverityWarning, 
+		"Retrying adoption of VM: %s", vmName)
+	
+	return ctrl.Result{RequeueAfter: 120 * time.Second}, nil
+}
+
+// ensureAdoptionAnnotationFromTemplate copies adoption annotation from KubevirtMachineTemplate to KubevirtMachine if missing
+func (r *KubevirtMachineReconciler) ensureAdoptionAnnotationFromTemplate(ctx gocontext.Context, kubevirtMachine *infrav1.KubevirtMachine) error {
+	logger := ctrl.LoggerFrom(ctx).WithValues("kubevirtMachine", kubevirtMachine.Name)
+	
+	// Check if adoption annotation already exists
+	if kubevirtMachine.Annotations != nil {
+		if _, exists := kubevirtMachine.Annotations[infrav1.ExistingVMName]; exists {
+			// Annotation already exists, nothing to do
+			return nil
+		}
+	}
+	
+	// Get the template name from cloned-from annotation
+	if kubevirtMachine.Annotations == nil {
+		return nil // No annotations at all, not cloned from template
+	}
+	
+	templateName, exists := kubevirtMachine.Annotations["cluster.x-k8s.io/cloned-from-name"]
+	if !exists {
+		return nil // Not cloned from template
+	}
+	
+	// Fetch the KubevirtMachineTemplate
+	kubevirtMachineTemplate := &infrav1.KubevirtMachineTemplate{}
+	templateKey := client.ObjectKey{
+		Namespace: kubevirtMachine.Namespace,
+		Name:      templateName,
+	}
+	
+	if err := r.Client.Get(ctx, templateKey, kubevirtMachineTemplate); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("KubevirtMachineTemplate not found, skipping annotation copy", "template", templateName)
+			return nil
+		}
+		return errors.Wrapf(err, "failed to get KubevirtMachineTemplate %s", templateName)
+	}
+	
+	// Check if template has adoption annotation
+	if kubevirtMachineTemplate.Annotations == nil {
+		return nil // Template has no annotations
+	}
+	
+	existingVMName, exists := kubevirtMachineTemplate.Annotations[infrav1.ExistingVMName]
+	if !exists || existingVMName == "" {
+		return nil // Template doesn't have adoption annotation
+	}
+	
+	// Copy adoption annotation to KubevirtMachine
+	if kubevirtMachine.Annotations == nil {
+		kubevirtMachine.Annotations = make(map[string]string)
+	}
+	kubevirtMachine.Annotations[infrav1.ExistingVMName] = existingVMName
+	
+	// Update the KubevirtMachine
+	if err := r.Client.Update(ctx, kubevirtMachine); err != nil {
+		return errors.Wrapf(err, "failed to update KubevirtMachine with adoption annotation")
+	}
+	
+	logger.Info("Copied adoption annotation from template to KubevirtMachine", 
+		"template", templateName, 
+		"existingVMName", existingVMName)
+	
+	return nil
 }
 
 func (r *KubevirtMachineReconciler) reconcileDelete(ctx *context.MachineContext) (ctrl.Result, error) {
@@ -555,6 +825,11 @@ func (r *KubevirtMachineReconciler) KubevirtClusterToKubevirtMachines(ctx gocont
 func (r *KubevirtMachineReconciler) reconcileKubevirtBootstrapSecret(ctx *context.MachineContext, infraClusterClient client.Client, vmNamespace string, sshKeys *ssh.ClusterNodeSshKeys) error {
 	if ctx.Machine.Spec.Bootstrap.DataSecretName == nil {
 		return errors.New("error retrieving bootstrap data: linked Machine's bootstrap.dataSecretName is nil")
+	}
+
+	// Log when injecting bootstrap data into adopted VM
+	if getExistingVMAnnotation(ctx.KubevirtMachine) != "" {
+		ctx.Logger.Info("Injecting CAPI bootstrap data into adopted VM")
 	}
 
 	s := &corev1.Secret{}

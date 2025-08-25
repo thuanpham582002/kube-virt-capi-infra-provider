@@ -5,3 +5,6 @@ bin/
 .idea/
 infrastructure-components.yaml
 _artifacts
+.claude/
+.claude-flow/
+

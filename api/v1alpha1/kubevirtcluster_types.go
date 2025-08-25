@@ -38,6 +38,12 @@ const ( //labels
 const ( // annotations
 	VmiDeletionGraceTime       = "capk.cluster.x-k8s.io/vmi-deletion-grace-time"
 	VmiDeletionGraceTimeEscape = "capk.cluster.x-k8s.io~1vmi-deletion-grace-time"
+	
+	// ExistingVMName annotation specifies the name of an existing VM to adopt
+	ExistingVMName = "capk.cluster.x-k8s.io/existing-vm-name"
+	
+	// AdoptionPhase annotation tracks the current phase of VM adoption process
+	AdoptionPhase = "capk.cluster.x-k8s.io/adoption-phase"
 )
 
 // KubevirtClusterSpec defines the desired state of KubevirtCluster.
