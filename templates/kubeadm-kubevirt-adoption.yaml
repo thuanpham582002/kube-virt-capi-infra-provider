@@ -1,0 +1,140 @@
+
+---
+# Cluster resource
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: kubeadm-direct-adoption-test
+  namespace: vm-lab
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+        - 10.243.0.0/16
+    services:
+      cidrBlocks:
+        - 10.95.0.0/16
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+    kind: KubevirtCluster
+    name: kubeadm-direct-adoption-test
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: kubeadm-direct-adoption-test-control-plane
+
+---
+# KubevirtCluster
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtCluster
+metadata:
+  name: kubeadm-direct-adoption-test
+  namespace: vm-lab
+spec:
+  controlPlaneServiceTemplate:
+    spec:
+      type: ClusterIP
+
+---
+# KubevirtMachineTemplate - với adoption annotation
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtMachineTemplate
+metadata:
+  name: kubeadm-direct-adoption-test-control-plane-template
+  namespace: vm-lab
+  annotations:
+    # 🔑 ADOPTION ANNOTATION tại template level
+    capk.cluster.x-k8s.io/existing-vm-name: "lab-vm-04"
+spec:
+  template:
+    spec:
+      virtualMachineTemplate:
+        metadata:
+          namespace: vm-lab
+          labels:
+            capk.cluster.x-k8s.io/cluster-name: kubeadm-direct-adoption-test
+        spec:
+          runStrategy: Always
+          template:
+            spec:
+              domain:
+                cpu:
+                  cores: 2
+                memory:
+                  guest: "2Gi"
+                devices:
+                  networkInterfaceMultiqueue: true
+                  disks:
+                    - disk:
+                        bus: virtio
+                      name: rootdisk
+                    - disk:
+                        bus: virtio
+                      name: cloudinit
+                  interfaces:
+                    - masquerade: {}
+                      name: default
+              networks:
+                - name: default
+                  pod: {}
+              volumes:
+                # 🔗 Sử dụng disk có sẵn của lab-vm-04
+                - dataVolume:
+                    name: lab-vm-04-disk
+                  name: rootdisk
+                - cloudInitNoCloud:
+                    userData: "#cloud-config\n# Bootstrap data injection point\n"
+                  name: cloudinit
+
+---
+# KubeadmControlPlane với MachineTemplate reference
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: kubeadm-direct-adoption-test-control-plane
+  namespace: vm-lab
+  annotations:
+    # 🔑 ADOPTION ANNOTATION tại Control Plane level
+    capk.cluster.x-k8s.io/existing-vm-name: "lab-vm-04"
+spec:
+  replicas: 1
+  version: v1.28.0
+
+  # 🎯 MachineTemplate reference
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+      kind: KubevirtMachineTemplate
+      name: kubeadm-direct-adoption-test-control-plane-template
+
+  kubeadmConfigSpec:
+    clusterConfiguration:
+      networking:
+        dnsDomain: "kubeadm-direct-adoption-test.vm-lab.local"
+        podSubnet: 10.243.0.0/16
+        serviceSubnet: 10.95.0.0/16
+      apiServer:
+        extraArgs:
+          cloud-provider: external
+        certSANs:
+          - localhost
+          - 127.0.0.1
+          - kubeadm-direct-adoption-test
+      controllerManager:
+        extraArgs:
+          cloud-provider: external
+    initConfiguration:
+      nodeRegistration:
+        criSocket: "unix:///var/run/containerd/containerd.sock"
+        kubeletExtraArgs:
+          cloud-provider: external
+          provider-id: "kubevirt://lab-vm-04"
+        ignorePreflightErrors:
+          - all
+    joinConfiguration:
+      nodeRegistration:
+        criSocket: "unix:///var/run/containerd/containerd.sock"
+        kubeletExtraArgs:
+          cloud-provider: external
+          provider-id: "kubevirt://lab-vm-04"
+
